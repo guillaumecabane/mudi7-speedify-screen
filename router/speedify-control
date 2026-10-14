@@ -1,0 +1,80 @@
+#!/bin/sh
+# Local-only backend for the GL.iNet screen adapter. No network listener.
+set -eu
+umask 077
+
+cli=${SPEEDIFY_CLI:-/usr/share/speedify/speedify_cli}
+jsonfilter=${SPEEDIFY_JSONFILTER:-jsonfilter}
+timer=${SPEEDIFY_TIMEOUT_BIN:-timeout}
+deadline=${SPEEDIFY_TIMEOUT_SECONDS:-8}
+lock=${SPEEDIFY_LOCK_DIR:-/var/run/speedify-screen-control.lock}
+
+fail() {
+    printf '{"error":"%s"}\n' "$1"
+    exit 1
+}
+
+[ "$#" -eq 1 ] || fail 'Usage: speedify-control status|on|off'
+case "$1" in status|on|off) action=$1 ;; *) fail 'Unsupported action' ;; esac
+case "$deadline" in ''|*[!0-9]*) fail 'Timeout must be an integer' ;; esac
+[ "$deadline" -ge 1 ] && [ "$deadline" -le 30 ] || fail 'Timeout must be 1 to 30 seconds'
+[ -x "$cli" ] || fail 'Speedify CLI is unavailable'
+command -v "$jsonfilter" >/dev/null 2>&1 || fail 'jsonfilter is unavailable'
+command -v "$timer" >/dev/null 2>&1 || fail 'timeout is unavailable'
+
+read_state() {
+    raw=$("$timer" "$deadline" "$cli" state 2>/dev/null) || fail 'Cannot read Speedify state'
+    state=$(printf '%s' "$raw" | "$jsonfilter" -e '@.state' 2>/dev/null) || fail 'Invalid Speedify state response'
+    case "$state" in
+        LOGGED_OUT|LOGGING_IN|LOGGED_IN|AUTO_CONNECTING|CONNECTING|DISCONNECTING|CONNECTED|OVERLIMIT|UNKNOWN) ;;
+        *) fail 'Unrecognized Speedify state' ;;
+    esac
+}
+
+if [ "$action" = status ]; then
+    read_state
+    printf '{"state":"%s"}\n' "$state"
+    exit 0
+fi
+
+# Serialize taps. A killed process can leave a stale lock; fail closed rather
+# than guessing that another connect/disconnect is safe. Status remains usable.
+mkdir "$lock" 2>/dev/null || fail 'Control is busy or lock directory is unavailable'
+trap 'rmdir "$lock" 2>/dev/null || :' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+read_state
+changed=false
+state_refreshed=false
+send_action() {
+    changed=true
+    if "$timer" "$deadline" "$cli" "$1" >/dev/null 2>&1; then return; fi
+    # The CLI can time out after the daemon accepted the request. Re-read the
+    # actual state rather than equating an unsuccessful CLI wait with failure.
+    read_state
+    state_refreshed=true
+    case "$action:$state" in
+        on:CONNECTED|on:CONNECTING|on:AUTO_CONNECTING) return ;;
+        off:LOGGED_IN|off:LOGGED_OUT|off:DISCONNECTING) return ;;
+        *) fail 'Speedify request failed or timed out; refresh status before retrying' ;;
+    esac
+}
+case "$action:$state" in
+    on:CONNECTED|on:CONNECTING|on:AUTO_CONNECTING) ;;
+    on:LOGGED_IN)
+        send_action connect
+        ;;
+    on:*) fail 'Cannot connect in the current Speedify state; check the Speedify admin page' ;;
+    off:LOGGED_IN|off:LOGGED_OUT) ;;
+    off:CONNECTED|off:CONNECTING|off:AUTO_CONNECTING|off:DISCONNECTING)
+        if [ "$state" != DISCONNECTING ]; then
+            send_action disconnect
+        fi
+        ;;
+    off:*) fail 'Cannot disconnect in the current Speedify state; check the Speedify admin page' ;;
+esac
+
+# A successful command is a request, not proof the tunnel is up/down.
+if [ "$state_refreshed" = false ]; then read_state; fi
+printf '{"requested":"%s","command_sent":%s,"state":"%s"}\n' "$action" "$changed" "$state"
